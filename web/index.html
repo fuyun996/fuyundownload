@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fuyun 下载器</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <div class="logo"><span class="logo-icon">⬇</span> fuyun 下载器</div>
+  <div class="header-right">
+    <span id="global-speed" class="global-speed"></span>
+    <button id="btn-settings" class="btn ghost" title="设置">⚙ 设置</button>
+  </div>
+</header>
+
+<main>
+  <div class="add-bar">
+    <input id="url-input" type="text" placeholder="粘贴下载链接（http/https），回车或点击添加…" autofocus>
+    <button id="btn-add" class="btn primary">添加下载</button>
+  </div>
+  <div id="error-bar" class="error-bar hidden"></div>
+  <div id="tasks"></div>
+  <div id="empty" class="empty hidden">
+    <div class="empty-icon">🗂</div>
+    <div>暂无任务 — 粘贴一个下载链接开始</div>
+    <div class="empty-sub">支持多连接分段下载 · 按网速自动调度 · 断点续传</div>
+  </div>
+</main>
+
+<footer>
+  <canvas id="spark" height="56"></canvas>
+  <div class="footer-info"><span id="footer-summary"></span></div>
+</footer>
+
+<div id="settings-modal" class="modal hidden">
+  <div class="modal-card">
+    <h2>设置</h2>
+    <label>下载目录
+      <input id="set-dir" type="text" spellcheck="false">
+    </label>
+    <div class="grid2">
+      <label>单任务最大连接数
+        <input id="set-conns" type="number" min="1" max="64">
+      </label>
+      <label>同时下载任务数
+        <input id="set-tasks" type="number" min="1" max="10">
+      </label>
+    </div>
+    <div class="grid2">
+      <label>全局最大连接数
+        <input id="set-global" type="number" min="1" max="512">
+      </label>
+      <label>服务端口（0=自动）
+        <input id="set-port" type="number" min="0" max="65535">
+      </label>
+    </div>
+    <label>User-Agent
+      <input id="set-ua" type="text" spellcheck="false">
+    </label>
+    <label>自定义请求头（每行一条，格式 Key: Value）
+      <textarea id="set-headers" rows="3" spellcheck="false"></textarea>
+    </label>
+    <label class="check"><input id="set-insecure" type="checkbox"> 忽略 HTTPS 证书错误</label>
+    <div class="modal-actions">
+      <button id="btn-settings-cancel" class="btn ghost">取消</button>
+      <button id="btn-settings-save" class="btn primary">保存</button>
+    </div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
