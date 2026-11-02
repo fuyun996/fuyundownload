@@ -280,3 +280,6 @@ footer {
 }
 
 .hidden { display: none !important; }
+
+#url-input { flex:1; padding:12px; border-radius:8px; min-width:0; }
+.add-options {display:flex; flex-wrap:wrap; gap:12px; margin-bottom:18px;} .add-options label {display:flex; flex-direction:column; gap:4px;}

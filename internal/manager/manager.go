@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -130,7 +131,7 @@ func SaveSettings(s Settings) error {
 		return err
 	}
 	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, p)
@@ -138,10 +139,15 @@ func SaveSettings(s Settings) error {
 
 // Manager 管理多个下载任务：排队调度、设置、事件广播。
 type Manager struct {
-	mu       sync.Mutex
-	settings Settings
-	tasks    []*core.Task
-	budget   *core.ConnBudget
+	mu        sync.Mutex
+	persistMu sync.Mutex
+	stopping  bool
+	active    map[string]bool
+	stop      chan struct{}
+	stopped   chan struct{}
+	settings  Settings
+	tasks     []*core.Task
+	budget    *core.ConnBudget
 
 	subs map[chan []byte]struct{}
 	kick chan struct{}
@@ -152,11 +158,15 @@ func New(settings Settings) *Manager {
 	settings.Normalize()
 	m := &Manager{
 		settings: settings,
-		budget:   core.NewConnBudget(settings.MaxGlobalConns),
-		subs:     make(map[chan []byte]struct{}),
-		kick:     make(chan struct{}, 1),
+		active:   map[string]bool{}, stop: make(chan struct{}), stopped: make(chan struct{}),
+		budget: core.NewConnBudget(settings.MaxGlobalConns),
+		subs:   make(map[chan []byte]struct{}),
+		kick:   make(chan struct{}, 1),
 	}
-	m.importResumable()
+	if !m.loadHistory() {
+		m.importResumable()
+	}
+	m.dispatch()
 	go m.broadcastLoop()
 	return m
 }
@@ -218,11 +228,11 @@ func (m *Manager) UpdateSettings(s Settings) error {
 	}
 	m.mu.Lock()
 	m.settings = s
+	m.budget.SetMax(s.MaxGlobalConns)
 	tasks := append([]*core.Task(nil), m.tasks...)
 	m.mu.Unlock()
 	for _, t := range tasks {
 		t.Configure(core.Options{
-			Dir:       s.DownloadDir,
 			MaxConns:  s.MaxConnsPerTask,
 			UserAgent: s.UserAgent,
 			Headers:   s.Headers,
@@ -230,11 +240,28 @@ func (m *Manager) UpdateSettings(s Settings) error {
 		})
 	}
 	m.kickBroadcast()
+	m.dispatch()
 	return nil
 }
 
 // AddTask 新增下载任务（排队后自动开始）。
 func (m *Manager) AddTask(rawURL, fileName string) (string, error) {
+	return m.AddTaskOptions(rawURL, fileName, 0, "", 0)
+}
+func (m *Manager) AddTaskOptions(rawURL, fileName string, priority int, checksum string, rate int64) (string, error) {
+	if rate < 0 {
+		return "", errors.New("限速不能为负数")
+	}
+	if checksum != "" {
+		if len(checksum) != 64 {
+			return "", errors.New("SHA-256 应为 64 位十六进制")
+		}
+		for _, c := range strings.ToLower(checksum) {
+			if !strings.ContainsRune("0123456789abcdef", c) {
+				return "", errors.New("SHA-256 格式错误")
+			}
+		}
+	}
 	rawURL = strings.TrimSpace(rawURL)
 	if rawURL == "" {
 		return "", errors.New("下载链接不能为空")
@@ -248,6 +275,7 @@ func (m *Manager) AddTask(rawURL, fileName string) (string, error) {
 	m.mu.Unlock()
 
 	t := core.NewTask(core.Options{
+		Priority: priority, SHA256: checksum, RateLimit: rate,
 		URL:       rawURL,
 		Dir:       s.DownloadDir,
 		FileName:  strings.TrimSpace(fileName),
@@ -258,8 +286,13 @@ func (m *Manager) AddTask(rawURL, fileName string) (string, error) {
 		Budget:    m.budget,
 	})
 	m.mu.Lock()
+	if m.stopping {
+		m.mu.Unlock()
+		return "", errors.New("程序正在退出")
+	}
 	m.tasks = append(m.tasks, t)
 	m.mu.Unlock()
+	m.saveHistory()
 	m.kickBroadcast()
 	m.dispatch()
 	return t.ID(), nil
@@ -349,9 +382,12 @@ func (m *Manager) Delete(id string, deleteFile bool) error {
 
 	if deleteFile {
 		go func() {
-			<-t.Done()
+			for t.Running() {
+				time.Sleep(20 * time.Millisecond)
+			}
 			if p := t.DisplayPath(); p != "" {
 				_ = os.Remove(p)
+				_ = os.Remove(p + ".part")
 				_ = os.Remove(core.StatePath(p))
 			}
 		}()
@@ -363,11 +399,12 @@ func (m *Manager) Delete(id string, deleteFile bool) error {
 // PauseAll 暂停全部运行中任务（程序退出前调用）。
 func (m *Manager) PauseAll() {
 	m.mu.Lock()
+	m.stopping = true
 	tasks := append([]*core.Task(nil), m.tasks...)
 	m.mu.Unlock()
 	for _, t := range tasks {
 		switch t.State() {
-		case core.StatusProbing, core.StatusDownloading:
+		case core.StatusPending, core.StatusProbing, core.StatusDownloading:
 			t.Pause()
 		}
 	}
@@ -375,22 +412,18 @@ func (m *Manager) PauseAll() {
 
 // WaitIdle 等待所有任务离开运行状态（限时）。
 func (m *Manager) WaitIdle(timeout time.Duration) {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		busy := false
+	for {
 		m.mu.Lock()
-		for _, t := range m.tasks {
-			switch t.State() {
-			case core.StatusProbing, core.StatusDownloading, core.StatusPausing:
-				busy = true
-			}
-		}
+		n := len(m.active)
 		m.mu.Unlock()
-		if !busy {
-			return
+		if n == 0 {
+			break
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
+	close(m.stop)
+	<-m.stopped
+	m.saveHistory()
 }
 
 // ---------- 内部调度 ----------
@@ -398,19 +431,19 @@ func (m *Manager) WaitIdle(timeout time.Duration) {
 // dispatch 按顺序启动排队任务，直至达到并发上限。
 func (m *Manager) dispatch() {
 	m.mu.Lock()
-	running := 0
-	for _, t := range m.tasks {
-		switch t.State() {
-		case core.StatusProbing, core.StatusDownloading, core.StatusPausing:
-			running++
-		}
+	if m.stopping {
+		m.mu.Unlock()
+		return
 	}
+	running := len(m.active)
+	sort.SliceStable(m.tasks, func(i, j int) bool { return m.tasks[i].Snapshot().Priority > m.tasks[j].Snapshot().Priority })
 	var toStart []*core.Task
 	for _, t := range m.tasks {
 		if running >= m.settings.MaxTasks {
 			break
 		}
-		if t.State() == core.StatusPending {
+		if t.State() == core.StatusPending && !m.active[t.ID()] {
+			m.active[t.ID()] = true
 			toStart = append(toStart, t)
 			running++
 		}
@@ -423,6 +456,9 @@ func (m *Manager) dispatch() {
 
 func (m *Manager) runTask(t *core.Task) {
 	_ = t.Run(context.Background())
+	m.mu.Lock()
+	delete(m.active, t.ID())
+	m.mu.Unlock()
 	m.kickBroadcast()
 	m.dispatch()
 }
@@ -451,10 +487,13 @@ func (m *Manager) kickBroadcast() {
 
 // broadcastLoop 每秒推送一次全量快照；状态变化时立即推送。
 func (m *Manager) broadcastLoop() {
+	defer close(m.stopped)
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
 		select {
+		case <-m.stop:
+			return
 		case <-ticker.C:
 			m.pushFrame()
 		case <-m.kick:
@@ -464,6 +503,7 @@ func (m *Manager) broadcastLoop() {
 }
 
 func (m *Manager) pushFrame() {
+	m.saveHistory()
 	snaps := m.List()
 	data, err := json.Marshal(snaps)
 	if err != nil {
@@ -476,5 +516,44 @@ func (m *Manager) pushFrame() {
 		case ch <- data:
 		default: // 慢消费者丢帧
 		}
+	}
+}
+
+func (m *Manager) historyPath() string {
+	return filepath.Join(filepath.Dir(SettingsPath()), "tasks.json")
+}
+func (m *Manager) loadHistory() bool {
+	data, err := os.ReadFile(m.historyPath())
+	if err != nil {
+		return false
+	}
+	var records []core.Record
+	if json.Unmarshal(data, &records) != nil {
+		return false
+	}
+	for _, r := range records {
+		m.tasks = append(m.tasks, core.Restore(r, m.budget))
+	}
+	return true
+}
+func (m *Manager) saveHistory() {
+	m.persistMu.Lock()
+	defer m.persistMu.Unlock()
+	m.mu.Lock()
+	records := make([]core.Record, 0, len(m.tasks))
+	for _, t := range m.tasks {
+		records = append(records, t.Record())
+	}
+	m.mu.Unlock()
+	data, err := json.Marshal(records)
+	if err != nil {
+		return
+	}
+	p := m.historyPath()
+	if os.MkdirAll(filepath.Dir(p), 0700) != nil {
+		return
+	}
+	if os.WriteFile(p+".tmp", data, 0600) == nil {
+		_ = os.Rename(p+".tmp", p)
 	}
 }

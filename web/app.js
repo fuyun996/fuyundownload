@@ -47,16 +47,20 @@ async function api(path, opts) {
 
 async function addTask() {
   const input = $('#url-input');
-  const url = input.value.trim();
+  const urls = input.value.trim().split(/\s+/).filter(Boolean);
+ const url=urls[0];
   if (!url) return;
   hideError();
   try {
-    await api('/api/tasks', {
+    if (urls.length>1 && $('#add-sha').value.trim()) throw new Error('校验和仅用于单个链接');
+ for (const url of urls) {
+ await api('/api/tasks', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url }),
+      body: JSON.stringify({ url, priority: +$('#add-priority').value || 0, rate_limit: (+$('#add-rate').value || 0)*1024, sha256: $('#add-sha').value.trim() }),
     });
-    input.value = '';
+    input.value = input.value.trim().split(/\s+/).slice(1).join('\n');
+ }
   } catch (e) {
     showError('添加失败：' + e.message);
   }
@@ -367,7 +371,7 @@ function onFrame(list) {
 function init() {
   $('#btn-add').addEventListener('click', addTask);
   $('#url-input').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') addTask();
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {e.preventDefault(); addTask();}
   });
   $('#btn-settings').addEventListener('click', openSettings);
   $('#btn-settings-cancel').addEventListener('click', () => $('#settings-modal').classList.add('hidden'));

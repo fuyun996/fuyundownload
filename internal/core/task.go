@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
 	"errors"
@@ -33,7 +34,7 @@ const (
 
 // 引擎参数
 const (
-	chunkSize          = 1 << 20          // 单次读取/写盘粒度 1 MiB
+	chunkSize          = 32 << 10         // 单次读取/写盘粒度 1 MiB
 	maxSegmentAttempts = 10               // 单段最大重试次数
 	stallTimeout       = 10 * time.Second // 连接无数据判定超时
 	defaultMaxConns    = 32
@@ -57,7 +58,10 @@ type Options struct {
 	UserAgent string
 	Headers   map[string]string // 额外请求头
 	Insecure  bool              // 忽略 HTTPS 证书校验
-	Budget    *ConnBudget       // 可选，全局连接预算
+	Priority  int
+	SHA256    string
+	RateLimit int64       // bytes per second, per task
+	Budget    *ConnBudget // 可选，全局连接预算
 }
 
 // ConnInfo 是单个连接的速度快照。
@@ -69,6 +73,9 @@ type ConnInfo struct {
 
 // Snapshot 是任务的对外状态快照（UI/CLI 展示用）。
 type Snapshot struct {
+	Priority    int        `json:"priority"`
+	SHA256      string     `json:"sha256,omitempty"`
+	RateLimit   int64      `json:"rate_limit"`
 	ID          string     `json:"id"`
 	URL         string     `json:"url"`
 	FileName    string     `json:"file_name"`
@@ -124,6 +131,9 @@ type Task struct {
 	connList []*connStat
 	active   atomic.Int64
 
+	running     bool
+	rateMu      sync.Mutex
+	rateNext    time.Time
 	cachedState *StateFile // 扫描导入时用于未运行状态的展示
 }
 
@@ -188,12 +198,16 @@ func (t *Task) DisplayPath() string {
 	return filepath.Join(dir, cs.FileName)
 }
 
-func (t *Task) Done() <-chan struct{} { return t.doneCh }
+func (t *Task) Done() <-chan struct{} { t.mu.Lock(); defer t.mu.Unlock(); return t.doneCh }
+func (t *Task) Running() bool         { t.mu.Lock(); defer t.mu.Unlock(); return t.running }
 
 // Pause 请求暂停（优雅停止并持久化断点）。
 func (t *Task) Pause() {
 	t.mu.Lock()
 	t.pauseRequested = true
+	if !t.running {
+		t.state = StatusPaused
+	}
 	fn := t.pauseFn
 	t.mu.Unlock()
 	if fn != nil {
@@ -205,6 +219,9 @@ func (t *Task) Pause() {
 func (t *Task) Cancel() {
 	t.mu.Lock()
 	t.cancelRequested = true
+	if !t.running {
+		t.state = StatusCanceled
+	}
 	fn := t.pauseFn
 	t.mu.Unlock()
 	if fn != nil {
@@ -283,10 +300,11 @@ func (t *Task) Snapshot() Snapshot {
 	optsName := t.opts.FileName
 	maxConns := t.opts.MaxConns
 	dir := t.opts.Dir
+	priority, checksum, rate := t.opts.Priority, t.opts.SHA256, t.opts.RateLimit
 	t.optsMu.Unlock()
 
 	t.mu.Lock()
-	s := Snapshot{
+	s := Snapshot{Priority: priority, SHA256: checksum, RateLimit: rate,
 		ID:          t.id,
 		URL:         optsURL,
 		State:       t.state,
@@ -299,6 +317,7 @@ func (t *Task) Snapshot() Snapshot {
 	}
 	info := t.info
 	speed := t.speed
+	table := t.table
 	cs := t.cachedState
 	t.mu.Unlock()
 
@@ -319,8 +338,8 @@ func (t *Task) Snapshot() Snapshot {
 	}
 
 	switch {
-	case t.table != nil:
-		done, total := t.table.Sum()
+	case table != nil:
+		done, total := table.Sum()
 		s.Downloaded = done
 		if total >= 0 {
 			s.TotalSize = total
@@ -370,11 +389,11 @@ func (t *Task) connSnapshot() []ConnInfo {
 // 返回 nil 表示完成；ErrPaused 表示已暂停（可续传）；ErrCanceled 表示已取消；其他为失败原因。
 func (t *Task) Run(ctx context.Context) error {
 	t.mu.Lock()
-	switch t.state {
-	case StatusProbing, StatusDownloading, StatusPausing:
+	if t.running || t.deleted {
 		t.mu.Unlock()
 		return errors.New("任务已在运行中")
 	}
+	t.running = true
 	t.state = StatusProbing
 	t.errMsg = ""
 	// 注意：不重置 pauseRequested/cancelRequested —— 排队期间收到的暂停/取消
@@ -387,7 +406,7 @@ func (t *Task) Run(ctx context.Context) error {
 	}
 	t.doneCh = make(chan struct{})
 	t.mu.Unlock()
-	defer close(t.doneCh)
+	defer func() { t.mu.Lock(); t.running = false; close(t.doneCh); t.mu.Unlock() }()
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -475,6 +494,7 @@ func (t *Task) budget() *ConnBudget {
 func (t *Task) run(ctx context.Context) error {
 	opts := t.optsSnapshot()
 	client := t.buildClient()
+	defer client.CloseIdleConnections()
 
 	info, err := Probe(ctx, client, opts.URL, opts.Headers, opts.UserAgent)
 	if err != nil {
@@ -495,10 +515,23 @@ func (t *Task) run(ctx context.Context) error {
 	if err := os.MkdirAll(opts.Dir, 0o755); err != nil {
 		return fmt.Errorf("创建下载目录失败: %w", err)
 	}
-	target := filepath.Join(opts.Dir, fileName)
+	fileName = sanitizeFileName(fileName)
+	target, err := filepath.Abs(filepath.Join(opts.Dir, fileName))
+	if err != nil {
+		return err
+	}
+	pathMu.Lock()
+	if activePaths[target] {
+		pathMu.Unlock()
+		return errors.New("同名文件正在下载")
+	}
+	activePaths[target] = true
+	pathMu.Unlock()
+	reservedTarget := target
+	defer func() { pathMu.Lock(); delete(activePaths, reservedTarget); pathMu.Unlock() }()
 	stPath := StatePath(target)
 	hadStateFile := false
-	if _, err := os.Stat(stPath); err == nil {
+	if st, err := LoadState(stPath); err == nil && st.URL == opts.URL {
 		hadStateFile = true
 	}
 
@@ -506,14 +539,16 @@ func (t *Task) run(ctx context.Context) error {
 	var table *SegmentTable
 	resume := false
 	if info.AcceptRanges && info.Size >= 0 {
-		if st, err := LoadState(stPath); err == nil && st.Compatible(info, opts.URL) && fileMatchesState(st, target) {
+		if st, err := LoadState(stPath); err == nil && st.Compatible(info, opts.URL) && fileMatchesState(st, partialPath(target)) {
 			table = NewSegmentTableFromState(st)
 			resume = true
 		}
 	}
 	fresh := !resume
 	if fresh {
-		_ = os.Remove(stPath) // 清除过期状态
+		if hadStateFile {
+			_ = os.Remove(stPath)
+		} // 仅清除本任务的过期状态
 		if info.AcceptRanges && info.Size >= 0 {
 			table = NewSegmentTable(info.Size)
 		} else {
@@ -527,7 +562,27 @@ func (t *Task) run(ctx context.Context) error {
 		}
 	}
 
-	f, err := os.OpenFile(target, os.O_RDWR|os.O_CREATE, 0o644)
+	if target != reservedTarget {
+		pathMu.Lock()
+		if activePaths[target] {
+			pathMu.Unlock()
+			return errors.New("同名文件正在下载")
+		}
+		activePaths[target] = true
+		delete(activePaths, reservedTarget)
+		reservedTarget = target
+		pathMu.Unlock()
+	}
+	t.optsMu.Lock()
+	t.opts.FileName = filepath.Base(target)
+	t.optsMu.Unlock()
+	workPath := target + ".part"
+	if resume && partialPath(target) == target {
+		if err := os.Rename(target, workPath); err != nil {
+			return err
+		}
+	}
+	f, err := os.OpenFile(workPath, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return fmt.Errorf("创建文件失败: %w", err)
 	}
@@ -558,7 +613,30 @@ func (t *Task) run(ctx context.Context) error {
 		maxConns = 1 // 不支持分段：单连接
 	}
 
-	return t.runSegments(ctx, client, info, table, f, maxConns, stPath)
+	if err := t.runSegments(ctx, client, info, table, f, maxConns, stPath); err != nil {
+		return err
+	}
+	if opts.SHA256 != "" {
+		if _, err := f.Seek(0, 0); err != nil {
+			return err
+		}
+		h := sha256.New()
+		if _, err := io.Copy(h, f); err != nil {
+			return err
+		}
+		if !strings.EqualFold(fmt.Sprintf("%x", h.Sum(nil)), opts.SHA256) {
+			table.Reset()
+			return errors.New("SHA-256 校验失败")
+		}
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(workPath, target); err != nil {
+		return err
+	}
+	_ = os.Remove(stPath)
+	return nil
 }
 
 // optsSnapshot 原子读取配置快照。
@@ -589,19 +667,25 @@ func fileMatchesState(st *StateFile, target string) bool {
 
 // dedupePath 目标文件已存在且非空时，追加序号避免覆盖。
 func dedupePath(target string) string {
-	fi, err := os.Stat(target)
-	if err != nil || fi.Size() == 0 {
+	available := func(p string) bool {
+		for _, suffix := range []string{"", ".part", ".fuyun"} {
+			if _, err := os.Stat(p + suffix); !os.IsNotExist(err) {
+				return false
+			}
+		}
+		return true
+	}
+	if available(target) {
 		return target
 	}
 	ext := filepath.Ext(target)
 	base := strings.TrimSuffix(target, ext)
-	for i := 1; i < 1000; i++ {
-		cand := fmt.Sprintf("%s(%d)%s", base, i, ext)
-		if _, err := os.Stat(cand); err != nil {
-			return cand
+	for i := 1; ; i++ {
+		p := fmt.Sprintf("%s(%d)%s", base, i, ext)
+		if available(p) {
+			return p
 		}
 	}
-	return target
 }
 
 func (t *Task) buildClient() *http.Client {
@@ -884,9 +968,6 @@ loop:
 		if err := f.Sync(); err != nil {
 			return fmt.Errorf("写盘失败: %w", err)
 		}
-		if t.canPersist() {
-			_ = os.Remove(stPath)
-		}
 		return nil
 	}
 	if fatal != nil {
@@ -959,7 +1040,7 @@ func (t *Task) downloadSegment(ctx context.Context, client *http.Client, info *P
 			return reportFatal(ctx, fmt.Errorf("请求失败（已重试 %d 次）: %w", maxSegmentAttempts, err), failCh)
 		}
 
-		if issue := checkSegmentResponse(resp, start, info); issue != nil {
+		if issue := checkSegmentResponse(resp, start, info, end); issue != nil {
 			_ = resp.Body.Close()
 			if issue.retryable && attempt < maxSegmentAttempts {
 				sleepBackoff(ctx, attempt, issue.retryAfter)
@@ -1039,16 +1120,20 @@ type respIssue struct {
 }
 
 // checkSegmentResponse 校验分段响应状态码。
-func checkSegmentResponse(resp *http.Response, start int64, info *ProbeResult) *respIssue {
+func checkSegmentResponse(resp *http.Response, start int64, info *ProbeResult, ends ...int64) *respIssue {
 	sc := resp.StatusCode
 	switch {
 	case sc == http.StatusPartialContent:
+		var a, b, total int64
+		if _, err := fmt.Sscanf(resp.Header.Get("Content-Range"), "bytes %d-%d/%d", &a, &b, &total); err != nil || a != start || b < a || (len(ends) > 0 && b != ends[0]) {
+			return &respIssue{err: errors.New("无效的 Content-Range 区间")}
+		}
 		if total, ok := parseContentRangeTotal(resp.Header.Get("Content-Range")); ok && total >= 0 && info.Size >= 0 && total != info.Size {
 			return &respIssue{err: fmt.Errorf("远端文件大小已变化（期望 %d 字节，实际 %d 字节）", info.Size, total)}
 		}
 		return nil
 	case sc == http.StatusOK:
-		if start > 0 {
+		if start > 0 || info.AcceptRanges {
 			if info.hasValidator() {
 				return &respIssue{err: errors.New("远端文件已变更（服务器返回完整内容而非分段）")}
 			}
@@ -1105,6 +1190,7 @@ func (t *Task) streamSegment(ctx context.Context, body io.Reader, seg *Segment, 
 	var lastData atomic.Int64
 	lastData.Store(time.Now().UnixNano())
 	var stalled atomic.Bool
+	var throttling atomic.Bool
 
 	reqCtx, cancelReq := context.WithCancel(ctx)
 	defer cancelReq()
@@ -1118,9 +1204,12 @@ func (t *Task) streamSegment(ctx context.Context, body io.Reader, seg *Segment, 
 			case <-reqCtx.Done():
 				return
 			case <-tick.C:
-				if time.Since(time.Unix(0, lastData.Load())) > stallTimeout {
+				if !throttling.Load() && time.Since(time.Unix(0, lastData.Load())) > stallTimeout {
 					stalled.Store(true)
 					cancelReq()
+					if c, ok := body.(io.Closer); ok {
+						_ = c.Close()
+					}
 					return
 				}
 			}
@@ -1133,6 +1222,12 @@ func (t *Task) streamSegment(ctx context.Context, body io.Reader, seg *Segment, 
 	var readErr error
 readLoop:
 	for {
+		throttling.Store(true)
+		if err := t.waitRate(ctx, len(buf)); err != nil {
+			return streamAbort, err
+		}
+		lastData.Store(time.Now().UnixNano())
+		throttling.Store(false)
 		n, err := body.Read(buf)
 		if n > 0 {
 			lastData.Store(time.Now().UnixNano())
@@ -1280,4 +1375,36 @@ func (t *Task) canPersist() bool {
 	info := t.info
 	t.mu.Unlock()
 	return info != nil && info.AcceptRanges && info.Size >= 0
+}
+
+var pathMu sync.Mutex
+var activePaths = map[string]bool{}
+
+func partialPath(target string) string {
+	if _, err := os.Stat(target + ".part"); err == nil {
+		return target + ".part"
+	}
+	return target
+}
+func (t *Task) waitRate(ctx context.Context, n int) error {
+	rate := t.optsSnapshot().RateLimit
+	if rate <= 0 {
+		return nil
+	}
+	t.rateMu.Lock()
+	now := time.Now()
+	at := t.rateNext
+	if at.Before(now) {
+		at = now
+	}
+	t.rateNext = at.Add(time.Duration(float64(n) / float64(rate) * float64(time.Second)))
+	t.rateMu.Unlock()
+	timer := time.NewTimer(time.Until(at))
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }

@@ -121,14 +121,17 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAddTask(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		URL      string `json:"url"`
-		FileName string `json:"file_name"`
+		URL       string `json:"url"`
+		FileName  string `json:"file_name"`
+		Priority  int    `json:"priority"`
+		SHA256    string `json:"sha256"`
+		RateLimit int64  `json:"rate_limit"`
 	}
 	if err := readJSON(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	id, err := s.mgr.AddTask(body.URL, body.FileName)
+	id, err := s.mgr.AddTaskOptions(body.URL, body.FileName, body.Priority, body.SHA256, body.RateLimit)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return

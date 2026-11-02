@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -36,6 +37,8 @@ const usage = `fuyun ` + core.Version + ` — 多连接高速下载工具（断�
   -H, --header "K: V"          附加请求头（可重复）
   -A, --user-agent UA          自定义 User-Agent
       --insecure               忽略 HTTPS 证书错误
+      --sha256 HASH             校验 SHA-256（单链接）
+      --limit KiB/s             每任务下载限速（0 不限）
   -q, --quiet                  静默模式（不显示进度）
   -h, --help                   显示帮助
 
@@ -152,6 +155,7 @@ func runUI(f uiFlags) {
 
 // 带值的选项
 var cliValueFlags = map[string]bool{
+	"sha256": true, "limit": true,
 	"o": true, "output-dir": true,
 	"O": true, "output": true,
 	"c": true, "conns": true,
@@ -199,6 +203,14 @@ func parseCLIArgs(args []string) (term.Options, error) {
 			}
 			v := args[i]
 			switch name {
+			case "sha256":
+				o.SHA256 = v
+			case "limit":
+				n, err := strconv.ParseInt(v, 10, 64)
+				if err != nil || n < 0 || n > 1<<40 {
+					return o, errors.New("无效限速")
+				}
+				o.RateLimit = n * 1024
 			case "o", "output-dir":
 				o.Dir = v
 			case "O", "output":

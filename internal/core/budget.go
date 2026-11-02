@@ -47,3 +47,11 @@ func (b *ConnBudget) Available() int {
 	defer b.mu.Unlock()
 	return b.max - b.used
 }
+
+func (b *ConnBudget) SetMax(n int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if n > 0 {
+		b.max = n
+	}
+}

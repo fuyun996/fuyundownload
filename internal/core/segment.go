@@ -271,3 +271,14 @@ func (t *SegmentTable) Snapshot() []SegmentState {
 	}
 	return out
 }
+
+func (t *SegmentTable) Reset() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.done = 0
+	for _, s := range t.segments {
+		s.Done = 0
+		s.complete = false
+		s.claimed = false
+	}
+}

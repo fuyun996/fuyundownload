@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"sort"
 	"time"
 )
 
@@ -63,6 +64,21 @@ func LoadState(path string) (*StateFile, error) {
 	if len(st.Segments) == 0 {
 		return nil, errors.New("empty state")
 	}
+	if st.Size < 0 {
+		return nil, errors.New("invalid size")
+	}
+	segs := append([]SegmentState(nil), st.Segments...)
+	sort.Slice(segs, func(i, j int) bool { return segs[i].Start < segs[j].Start })
+	var next int64
+	for _, s := range segs {
+		if s.Start != next || s.End < s.Start || s.Done < 0 || s.Done > s.End-s.Start+1 {
+			return nil, errors.New("invalid segments")
+		}
+		next = s.End + 1
+	}
+	if next != st.Size {
+		return nil, errors.New("incomplete segment coverage")
+	}
 	return &st, nil
 }
 
@@ -86,6 +102,8 @@ func (st *StateFile) Compatible(info *ProbeResult, origURL string) bool {
 		if st.LastModified != info.LastModified {
 			return false
 		}
+	} else {
+		return false
 	}
 	return true
 }

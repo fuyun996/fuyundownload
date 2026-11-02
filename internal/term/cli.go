@@ -2,6 +2,7 @@ package term
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/url"
@@ -19,6 +20,8 @@ import (
 
 // Options 是命令行模式的参数。
 type Options struct {
+	SHA256    string
+	RateLimit int64
 	URLs      []string
 	Dir       string
 	FileName  string // 仅单个 URL 时有效
@@ -32,6 +35,17 @@ type Options struct {
 
 // Run 执行命令行下载，返回进程退出码。
 func Run(o Options) int {
+	if o.SHA256 != "" && len(o.URLs) != 1 {
+		fmt.Fprintln(os.Stderr, "校验和仅用于单个链接")
+		return 2
+	}
+	if o.SHA256 != "" {
+		b, err := hex.DecodeString(o.SHA256)
+		if err != nil || len(b) != 32 {
+			fmt.Fprintln(os.Stderr, "SHA-256 应为 64 位十六进制")
+			return 2
+		}
+	}
 	hdrs := map[string]string{}
 	for _, h := range o.Headers {
 		i := strings.Index(h, ":")
@@ -67,6 +81,7 @@ func Run(o Options) int {
 			name = o.FileName
 		}
 		tasks = append(tasks, core.NewTask(core.Options{
+			SHA256: o.SHA256, RateLimit: o.RateLimit,
 			URL:       raw,
 			Dir:       dir,
 			FileName:  name,

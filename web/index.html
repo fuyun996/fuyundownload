@@ -17,9 +17,10 @@
 
 <main>
   <div class="add-bar">
-    <input id="url-input" type="text" placeholder="粘贴下载链接（http/https），回车或点击添加…" autofocus>
+    <textarea id="url-input" rows="3" placeholder="每行一个下载链接；Ctrl+Enter 添加" autofocus></textarea>
     <button id="btn-add" class="btn primary">添加下载</button>
   </div>
+  <div class="add-options"><label>优先级 <input id="add-priority" type="number" value="0"></label><label>每任务限速（KiB/s，0 不限）<input id="add-rate" type="number" min="0" value="0"></label><label>SHA-256（可选，仅单链接）<input id="add-sha" type="text" maxlength="64"></label></div>
   <div id="error-bar" class="error-bar hidden"></div>
   <div id="tasks"></div>
   <div id="empty" class="empty hidden">
